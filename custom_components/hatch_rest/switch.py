@@ -19,8 +19,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up Hatch Rest switch."""
     coordinator = config_entry.runtime_data
-    # only need to update_before_add on one entity -- switch is "master" entity
-    async_add_entities([HatchBabyRestSwitch(coordinator)], update_before_add=True)
+    # update_before_add=False: coordinator data is already seeded via async_set_updated_data
+    # in __init__.py; triggering a BLE round-trip here would stall platform setup.
+    async_add_entities([HatchBabyRestSwitch(coordinator)], update_before_add=False)
 
 
 class HatchBabyRestSwitch(HatchBabyRestEntity, SwitchEntity):  # pyright: ignore[reportIncompatibleVariableOverride]

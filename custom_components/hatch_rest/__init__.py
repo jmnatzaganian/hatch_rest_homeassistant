@@ -32,15 +32,12 @@ async def async_setup_entry(
     )
     entry.runtime_data = coordinator
 
-    # Fetch initial data so we have data when entities subscribe
-    #
-    # If the refresh fails, async_config_entry_first_refresh will
-    # raise ConfigEntryNotReady and setup will try again later
-    #
-    # If you do not want to retry setup on failure, use
-    # coordinator.async_refresh() instead
-
-    await coordinator.async_config_entry_first_refresh()
+    # Set initial (empty) data immediately so entities come up without blocking on
+    # a BLE connect. Both async_config_entry_first_refresh and async_refresh await
+    # a full BLE round-trip (80-120s when a device is unreachable), which stalls
+    # HA startup across all three devices. Real state arrives via the first poll
+    # or optimistically when a command is sent.
+    coordinator.async_set_updated_data(coordinator.get_current_data())
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
