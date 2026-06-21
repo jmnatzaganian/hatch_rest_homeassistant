@@ -174,8 +174,13 @@ class PyHatchBabyRestAsync:
         self._set_active_operations(1)
         await self._client_connect()
 
+        if self._client is None:
+            _LOGGER.warning("_send_command: connect failed, skipping write")
+            self._set_active_operations(-1)
+            return
+
         try:
-            await self._client.write_gatt_char(  # pyright: ignore[reportOptionalMemberAccess]
+            await self._client.write_gatt_char(
                 char_specifier=CHAR_TX,
                 data=bytearray(command, "utf-8"),
                 response=True,
@@ -209,8 +214,13 @@ class PyHatchBabyRestAsync:
         self._set_active_operations(1)
         await self._client_connect()
 
+        if self._client is None:
+            _LOGGER.warning("refresh_data: connect failed, skipping read")
+            self._set_active_operations(-1)
+            return
+
         try:
-            raw_char_read = await self._client.read_gatt_char(CHAR_FEEDBACK)  # pyright: ignore[reportOptionalMemberAccess]
+            raw_char_read = await self._client.read_gatt_char(CHAR_FEEDBACK)
             _LOGGER.debug("Raw char read from refresh_data: %s", raw_char_read)
 
             response = [hex(x) for x in raw_char_read]
