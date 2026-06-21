@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 import logging
+from time import monotonic
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
@@ -16,6 +17,10 @@ from .api import PyHatchBabyRestAsync
 from .const import DOMAIN, PyHatchBabyRestSound
 
 _LOGGER = logging.getLogger(__name__)
+
+# After N consecutive failures, delay the next attempt by this many seconds.
+# Progression: 1 min → 5 min → 15 min (capped). Resets on first success.
+_BACKOFF_SCHEDULE = (60.0, 300.0, 900.0)
 
 
 class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
@@ -32,13 +37,17 @@ class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=60),
+            # Sound machines don't change state on their own; optimistic updates
+            # from commands keep entities current. Poll is a slow safety net only.
+            update_interval=timedelta(minutes=10),
         )
         self.unique_id = unique_id
         self.hatch_rest_device = hatch_rest_device
         self._last_data: dict[
             str, int | tuple[int, int, int] | bool | PyHatchBabyRestSound | None
         ] = {}
+        self._consecutive_failures: int = 0
+        self._backoff_until: float = 0.0
 
     def get_current_data(
         self,
@@ -59,20 +68,41 @@ class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(
         self,
     ) -> dict[str, int | tuple[int, int, int] | bool | PyHatchBabyRestSound | None]:
+        now = monotonic()
+        if self._backoff_until > now:
+            _LOGGER.debug(
+                "Skipping poll: in backoff for %.0f more seconds",
+                self._backoff_until - now,
+            )
+            return self._last_data if self._last_data else self.get_current_data()
+
         _LOGGER.debug("Starting coordinator async update")
         self._last_data = self.data if self.data else {}
         try:
             await self.hatch_rest_device.refresh_data()
         except Exception as e:
+            self._consecutive_failures += 1
+            backoff = _BACKOFF_SCHEDULE[
+                min(self._consecutive_failures - 1, len(_BACKOFF_SCHEDULE) - 1)
+            ]
+            self._backoff_until = monotonic() + backoff
             _LOGGER.warning(
-                "_async_update_data failed to refresh Hatch Rest data: %r", e
+                "_async_update_data failed (failure #%d, backing off %.0fs): %r",
+                self._consecutive_failures,
+                backoff,
+                e,
             )
-            # Don’t raise; use previous successful data if available
             if self._last_data:
-                _LOGGER.debug("Using cached data due to _async_update_data failure")
                 return self._last_data
             raise UpdateFailed(f"Device update failed: {e}") from e
         else:
+            if self._consecutive_failures:
+                _LOGGER.info(
+                    "Device responded after %d consecutive failure(s); resetting backoff",
+                    self._consecutive_failures,
+                )
+            self._consecutive_failures = 0
+            self._backoff_until = 0.0
             return self.get_current_data()
 
 
