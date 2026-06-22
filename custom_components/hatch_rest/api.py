@@ -309,6 +309,16 @@ class PyHatchBabyRestAsync:
                 self._active_operations,
             )
             try:
+                if self._is_notifying:
+                    try:
+                        await self._client.stop_notify(CHAR_LIST)
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.debug("stop_notify CHAR_LIST failed (harmless): %r", e)
+                    try:
+                        await self._client.stop_notify(CHAR_FEEDBACK)
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.debug("stop_notify CHAR_FEEDBACK failed (harmless): %r", e)
+                    self._is_notifying = False
                 await self._client.disconnect()
             except Exception as e:  # noqa: BLE001
                 _LOGGER.warning("Exception during _client_disconnect -- %r", e)
