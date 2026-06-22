@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 import logging
+from time import monotonic
 
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
@@ -44,6 +45,8 @@ class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
 
         self._refresh_timer = None
         self._advertisement_hint: bool = False
+        self._consecutive_failures: int = 0
+        self._backoff_until: float = 0.0
 
         # Register callback for real-time updates from connections
         self.hatch_rest_device.register_callback(self._handle_api_update)
@@ -137,16 +140,40 @@ class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
     async def _async_update_data(
         self,
     ) -> dict[str, int | tuple[int, int, int] | bool | PyHatchBabyRestSound | None]:
+        now = monotonic()
+        if self._backoff_until > now:
+            _LOGGER.debug(
+                "Skipping poll: in backoff for %.0f more seconds",
+                self._backoff_until - now,
+            )
+            return self._last_data if self._last_data else self.get_current_data()
+
         _LOGGER.debug("Starting coordinator async update")
         self._last_data = self.data if self.data else {}
         try:
             await self.hatch_rest_device.refresh_data()
         except Exception as e:
-            _LOGGER.warning("_async_update_data failed: %r", e)
+            self._consecutive_failures += 1
+            # 1 min → 5 min → 15 min cap
+            backoff = min(60.0 * (5 ** (self._consecutive_failures - 1)), 900.0)
+            self._backoff_until = monotonic() + backoff
+            _LOGGER.warning(
+                "_async_update_data failed (failure #%d, backing off %.0fs): %r",
+                self._consecutive_failures,
+                backoff,
+                e,
+            )
             if self._last_data:
                 return self._last_data
             from homeassistant.helpers.update_coordinator import UpdateFailed
             raise UpdateFailed(f"Device update failed: {e}") from e
+        if self._consecutive_failures:
+            _LOGGER.info(
+                "Device responded after %d consecutive failure(s); resetting backoff",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+        self._backoff_until = 0.0
         return self.get_current_data()
 
 
