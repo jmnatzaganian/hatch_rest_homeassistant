@@ -87,6 +87,12 @@ class PyHatchBabyRestAsync:
         # are unaffected by device clock accuracy.
         self._last_clock_sync_date: str | None = None
 
+        # True while _send_commands holds _send_lock. Advertisement-sourced state
+        # updates are suppressed during this window to prevent the device's in-flight
+        # pre-command broadcast from briefly reverting an optimistic state update
+        # (the "volume oscillation" symptom seen during scene playback).
+        self._command_in_flight: bool = False
+
         self._init_collections()
 
     @property
@@ -136,13 +142,21 @@ class PyHatchBabyRestAsync:
         if MANUFACTURER_ID not in service_info.manufacturer_data:
             return
 
-        data = service_info.manufacturer_data[MANUFACTURER_ID]
-        _LOGGER.debug("Received advertisement data: %s", data.hex())
-
-        # Update the BLEDevice so the next connection is faster
+        # Always update the BLEDevice so the next connection uses the freshest
+        # RSSI/address, even if we suppress the state parse below.
         self.update_ble_device(service_info.device)
 
-        # Parse the advertisement data (it uses the same tagged format)
+        if self._command_in_flight:
+            # The device broadcasts its current (pre-command) state while we are
+            # mid-write. Parsing that advertisement would briefly revert the
+            # optimistic state set by the command, causing visible oscillation
+            # (e.g. volume flickering during scene playback). Skip the parse;
+            # the notification response from the command will update state instead.
+            _LOGGER.debug("Suppressing advertisement state update: command in flight")
+            return
+
+        data = service_info.manufacturer_data[MANUFACTURER_ID]
+        _LOGGER.debug("Received advertisement data: %s", data.hex())
         self._parse_data(data)
 
     def register_callback(self, callback: Callable[[], None]) -> None:
@@ -363,22 +377,26 @@ class PyHatchBabyRestAsync:
                 start = monotonic()
                 _LOGGER.debug("Started batch _send_commands at %s", datetime.now().isoformat())
 
-            async with self._active_operation() as client:
-                # Enqueue response slots AFTER connecting — connect resets the deques on reconnect.
-                if pgb_slot is not None:
-                    self._pending_pgb_slots.append(pgb_slot)
-                if egb_slot is not None:
-                    self._pending_egb_slots.append(egb_slot)
+            self._command_in_flight = True
+            try:
+                async with self._active_operation() as client:
+                    # Enqueue response slots AFTER connecting — connect resets the deques on reconnect.
+                    if pgb_slot is not None:
+                        self._pending_pgb_slots.append(pgb_slot)
+                    if egb_slot is not None:
+                        self._pending_egb_slots.append(egb_slot)
 
-                if client and client.is_connected:
-                    for i, command in enumerate(commands):
-                        data = bytearray.fromhex(command) if raw else bytearray(command, "utf-8")
-                        _LOGGER.debug("Sending command '%s' (Hex: %s)", command, data.hex())
-                        await client.write_gatt_char(char_specifier=CHAR_TX, data=data, response=response)
-                        if i < len(commands) - 1 and spacing_delay > 0:
-                            await asyncio.sleep(spacing_delay)
-                else:
-                    _LOGGER.warning("Could not send commands: Not connected to device")
+                    if client and client.is_connected:
+                        for i, command in enumerate(commands):
+                            data = bytearray.fromhex(command) if raw else bytearray(command, "utf-8")
+                            _LOGGER.debug("Sending command '%s' (Hex: %s)", command, data.hex())
+                            await client.write_gatt_char(char_specifier=CHAR_TX, data=data, response=response)
+                            if i < len(commands) - 1 and spacing_delay > 0:
+                                await asyncio.sleep(spacing_delay)
+                    else:
+                        _LOGGER.warning("Could not send commands: Not connected to device")
+            finally:
+                self._command_in_flight = False
 
             if log_timing:
                 _LOGGER.debug(
