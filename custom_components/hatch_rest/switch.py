@@ -34,7 +34,7 @@ async def async_setup_entry(
     for i in range(1, 11):
         entities.append(HatchBabyRestScheduleEnabledSwitch(coordinator, i))
 
-    async_add_entities(entities, update_before_add=True)
+    async_add_entities(entities, update_before_add=False)
 
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(

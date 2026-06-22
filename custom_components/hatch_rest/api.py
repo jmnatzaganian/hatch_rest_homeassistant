@@ -248,13 +248,18 @@ class PyHatchBabyRestAsync:
                         CHAR_TX, bytearray(b"GF"), response=False
                     )
 
-                    # Sync clock on every connection
-                    now = datetime.now()
-                    clock_cmd = f"ST{now.strftime('%Y%m%d%H%M%S')}U"
-                    _LOGGER.debug("Syncing clock: %s", clock_cmd)
-                    await client.write_gatt_char(
-                        CHAR_TX, bytearray(clock_cmd, "utf-8"), response=False
-                    )
+                    # Clock sync DISABLED 2026-06-10 (lockup investigation).
+                    # The fork wrote ST<time> to the device on EVERY connect. A write-to-device
+                    # on every poll cycle (~every 10 min) is the most plausible trigger for the
+                    # hard firmware lockups (device wedged, needs minutes-long power-off to recover).
+                    # The Hatch keeps its own clock fine; HA drives scenes, not onboard schedules.
+                    # Proper fix in the planned fork: gate this to once / 24h, not per-connect.
+                    # now = datetime.now()
+                    # clock_cmd = f"ST{now.strftime('%Y%m%d%H%M%S')}U"
+                    # _LOGGER.debug("Syncing clock: %s", clock_cmd)
+                    # await client.write_gatt_char(
+                    #     CHAR_TX, bytearray(clock_cmd, "utf-8"), response=False
+                    # )
 
                     fetch_age = monotonic() - self._last_full_fetch if self._last_full_fetch else None
                     if fetch_age is None or fetch_age > self.full_refresh_interval:
