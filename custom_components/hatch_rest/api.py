@@ -80,6 +80,13 @@ class PyHatchBabyRestAsync:
         # To pick up Hatch-app changes, reload the integration in HA.
         self._has_fetched_full: bool = False
 
+        # Clock sync: written to the device at most once per calendar day, gated
+        # to after 02:30 local time so DST transitions (which happen at 02:00) are
+        # already reflected in datetime.now() before we read it.
+        # The device clock only drives the onboard scheduler — HA scenes/automations
+        # are unaffected by device clock accuracy.
+        self._last_clock_sync_date: str | None = None
+
         self._init_collections()
 
     @property
@@ -250,18 +257,23 @@ class PyHatchBabyRestAsync:
                         CHAR_TX, bytearray(b"GF"), response=False
                     )
 
-                    # Clock sync DISABLED 2026-06-10 (lockup investigation).
-                    # The fork wrote ST<time> to the device on EVERY connect. A write-to-device
-                    # on every poll cycle (~every 10 min) is the most plausible trigger for the
-                    # hard firmware lockups (device wedged, needs minutes-long power-off to recover).
-                    # The Hatch keeps its own clock fine; HA drives scenes, not onboard schedules.
-                    # Proper fix in the planned fork: gate this to once / 24h, not per-connect.
-                    # now = datetime.now()
-                    # clock_cmd = f"ST{now.strftime('%Y%m%d%H%M%S')}U"
-                    # _LOGGER.debug("Syncing clock: %s", clock_cmd)
-                    # await client.write_gatt_char(
-                    #     CHAR_TX, bytearray(clock_cmd, "utf-8"), response=False
-                    # )
+                    # Sync device clock at most once per calendar day, but not before
+                    # 02:30 local time. DST transitions happen at 02:00 — waiting until
+                    # 02:30 ensures the OS has applied the new UTC offset before we read
+                    # datetime.now(), so the timestamp written to the device is always
+                    # correct for the current DST state.
+                    # The device clock only drives the onboard scheduler; HA scenes and
+                    # automations run on HA's clock and are unaffected by this value.
+                    now = datetime.now()
+                    today = now.strftime("%Y-%m-%d")
+                    past_dst_window = now.hour > 2 or (now.hour == 2 and now.minute >= 30)
+                    if self._last_clock_sync_date != today and past_dst_window:
+                        clock_cmd = f"ST{now.strftime('%Y%m%d%H%M%S')}U"
+                        _LOGGER.debug("Syncing device clock: %s", clock_cmd)
+                        await client.write_gatt_char(
+                            CHAR_TX, bytearray(clock_cmd, "utf-8"), response=False
+                        )
+                        self._last_clock_sync_date = today
 
                     if not self._has_fetched_full:
                         _LOGGER.debug("Fetching favorites and schedules (first connect this session)")
