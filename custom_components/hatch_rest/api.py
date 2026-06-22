@@ -316,7 +316,9 @@ class PyHatchBabyRestAsync:
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
 
-        self._disconnect_timer = asyncio.get_event_loop().call_later(
+        # _schedule_disconnect is only ever called from inside an active operation
+        # (the _active_operation context manager), so a running loop always exists.
+        self._disconnect_timer = asyncio.get_running_loop().call_later(
             10, lambda: asyncio.create_task(self._client_disconnect())
         )
         _LOGGER.debug("Scheduled disconnect in 10 seconds")

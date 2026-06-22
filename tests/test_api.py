@@ -1,7 +1,6 @@
 """Tests for Hatch Rest API."""
 
 from datetime import datetime
-from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -264,41 +263,76 @@ class TestPyHatchBabyRestAsync:
                 pgb_slot=2,
             )
 
+    @staticmethod
+    def _clock_writes(mock_client: AsyncMock) -> list:
+        """Return any CHAR_TX writes that are ST clock-sync commands."""
+        return [
+            call
+            for call in mock_client.write_gatt_char.call_args_list
+            if call.args
+            and call.args[0] == CHAR_TX
+            and bytes(call.args[1]).startswith(b"ST")
+        ]
+
     @pytest.mark.asyncio
-    async def test_client_connect_syncs_clock(self, api: PyHatchBabyRestAsync):
-        """Test that clock is synced upon connection."""
+    async def test_client_connect_syncs_clock_once_per_day(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """Clock syncs on the first connect of the day, then not again that day."""
         mock_client = MagicMock()
         mock_client.is_connected = True
         mock_client.start_notify = AsyncMock()
         mock_client.write_gatt_char = AsyncMock()
 
+        # 10:00 is past the 02:30 DST-safe gate, so a sync is allowed.
         fixed_now = datetime(2026, 4, 20, 10, 0, 0)
         with patch("custom_components.hatch_rest.api.datetime") as mock_datetime:
             mock_datetime.now.return_value = fixed_now
-            mock_datetime.strftime = datetime.strftime
 
             with patch(
                 "custom_components.hatch_rest.api.establish_connection",
                 new_callable=AsyncMock,
                 return_value=mock_client,
-            ):
-                with patch.object(api, "_fetch_favorites", new_callable=AsyncMock):
-                  with patch.object(api, "_fetch_schedules", new_callable=AsyncMock):
-                    # Scenario 1: Full fetch (last_full_fetch is None)
-                    api._last_full_fetch = None
-                    await api._client_connect()
-                    mock_client.write_gatt_char.assert_any_call(
-                        CHAR_TX, bytearray(b"ST20260420100000U"), response=False
-                    )
+            ), patch.object(
+                api, "_fetch_favorites", new_callable=AsyncMock
+            ), patch.object(api, "_fetch_schedules", new_callable=AsyncMock):
+                # First connect of the day: clock IS synced.
+                await api._client_connect()
+                mock_client.write_gatt_char.assert_any_call(
+                    CHAR_TX, bytearray(b"ST20260420100000U"), response=False
+                )
+                assert api._last_clock_sync_date == "2026-04-20"
 
-                    # Scenario 2: Recent fetch (sync should still happen)
-                    mock_client.write_gatt_char.reset_mock()
-                    api._client = None # Reset to trigger connect
-                    api._last_full_fetch = monotonic()
-                    await api._client_connect()
-                    mock_client.write_gatt_char.assert_any_call(
-                        CHAR_TX, bytearray(b"ST20260420100000U"), response=False
-                    )
+                # Same-day reconnect: clock is NOT synced again.
+                mock_client.write_gatt_char.reset_mock()
+                api._client = None  # reset to force a fresh connect
+                await api._client_connect()
+                assert self._clock_writes(mock_client) == []
+
+    @pytest.mark.asyncio
+    async def test_client_connect_skips_clock_before_dst_window(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """No clock sync before 02:30 local time (DST guard)."""
+        mock_client = MagicMock()
+        mock_client.is_connected = True
+        mock_client.start_notify = AsyncMock()
+        mock_client.write_gatt_char = AsyncMock()
+
+        fixed_now = datetime(2026, 4, 20, 2, 15, 0)  # before the 02:30 gate
+        with patch("custom_components.hatch_rest.api.datetime") as mock_datetime:
+            mock_datetime.now.return_value = fixed_now
+
+            with patch(
+                "custom_components.hatch_rest.api.establish_connection",
+                new_callable=AsyncMock,
+                return_value=mock_client,
+            ), patch.object(
+                api, "_fetch_favorites", new_callable=AsyncMock
+            ), patch.object(api, "_fetch_schedules", new_callable=AsyncMock):
+                await api._client_connect()
+                assert self._clock_writes(mock_client) == []
+                assert api._last_clock_sync_date is None
 
     def test_active_operations_starts_at_zero(self, api: PyHatchBabyRestAsync):
         """Test active operations counter initializes to zero."""

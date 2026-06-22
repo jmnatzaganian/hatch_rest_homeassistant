@@ -90,21 +90,25 @@ class TestHatchBabyRestLight:
     ):
         """Test turning on with brightness."""
         light_entity._hatch_rest_device.power = True
-        light_entity._hatch_rest_device.set_brightness = AsyncMock()
+        light_entity._hatch_rest_device.set_light_state = AsyncMock()
 
         await light_entity.async_turn_on(**{ATTR_BRIGHTNESS: 200})
 
-        light_entity._hatch_rest_device.set_brightness.assert_called_once_with(200)
+        light_entity._hatch_rest_device.set_light_state.assert_called_once_with(
+            brightness=200, color=None
+        )
 
     @pytest.mark.asyncio
     async def test_async_turn_on_with_rgb(self, light_entity: HatchBabyRestLight):
         """Test turning on with RGB color."""
         light_entity._hatch_rest_device.power = True
-        light_entity._hatch_rest_device.set_color = AsyncMock()
+        light_entity._hatch_rest_device.set_light_state = AsyncMock()
 
         await light_entity.async_turn_on(**{ATTR_RGB_COLOR: (255, 0, 128)})
 
-        light_entity._hatch_rest_device.set_color.assert_called_once_with(255, 0, 128)
+        light_entity._hatch_rest_device.set_light_state.assert_called_once_with(
+            brightness=None, color=(255, 0, 128)
+        )
 
     @pytest.mark.asyncio
     async def test_async_turn_on_powers_on_if_needed(
@@ -113,12 +117,14 @@ class TestHatchBabyRestLight:
         """Test turn_on powers device on if off."""
         light_entity._hatch_rest_device.power = False
         light_entity._hatch_rest_device.turn_power_on = AsyncMock()
-        light_entity._hatch_rest_device.set_brightness = AsyncMock()
+        light_entity._hatch_rest_device.set_light_state = AsyncMock()
 
         await light_entity.async_turn_on(**{ATTR_BRIGHTNESS: 100})
 
         light_entity._hatch_rest_device.turn_power_on.assert_called_once()
-        light_entity._hatch_rest_device.set_brightness.assert_called_once_with(100)
+        light_entity._hatch_rest_device.set_light_state.assert_called_once_with(
+            brightness=100, color=None
+        )
 
     @pytest.mark.asyncio
     async def test_async_turn_off(self, light_entity: HatchBabyRestLight):

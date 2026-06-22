@@ -12,7 +12,7 @@ Fully asynchronous and locally controlled — no cloud required. Built on a rewr
 * **Full favorites support** — reads all 6 favorite slots on connect, enables/disables slots without overwriting their content, and exposes only enabled favorites in the selector
 * **Schedule support** — reads all 10 schedule slots and exposes enable/disable toggles for each
 * **Timer control** — set and monitor a sleep timer; the remaining time is shown as a live-countdown sensor
-* **Configurable refresh interval** — adjust how often the integration re-fetches favorites and schedules via the options flow (default: 10 minutes)
+* **Configurable scan interval** — adjust the background state-poll interval via the options flow (default: 60 minutes). State arrives primarily from advertisements/commands, so this poll is a slow safety net rather than the primary state source.
 
 ## 📦 Installation
 
@@ -27,7 +27,7 @@ Fully asynchronous and locally controlled — no cloud required. Built on a rewr
 1. Go to **Settings → Devices & Services → Add Integration**
 2. Search for **Hatch Rest**
 3. Choose your discovered device from the list
-4. Configure the **Scan Interval** (default: 10 minutes)
+4. Configure the **Scan Interval** (default: 60 minutes)
 5. Done!
 
 ## 🧩 Entities

@@ -88,10 +88,17 @@ class TestAsyncSetupEntry:
                 await async_setup_entry(hass, mock_entry)
 
     @pytest.mark.asyncio
-    async def test_setup_entry_refresh_fails(
+    async def test_setup_entry_succeeds_when_device_unreachable(
         self, hass: HomeAssistant, mock_entry: MagicMock
     ):
-        """Test setup entry fails when initial refresh fails."""
+        """Setup must NOT block on / fail from an unreachable device.
+
+        The startup fix replaced async_config_entry_first_refresh() (which awaited a
+        full BLE round-trip and raised ConfigEntryNotReady on failure) with
+        async_set_updated_data() seeded from all-None state. Entities come up
+        ``unknown`` and populate later via advertisements/poll, so setup succeeds
+        even when the device is unreachable and a refresh would fail.
+        """
         mock_ble_device = MagicMock()
         mock_ble_device.address = "AA:BB:CC:DD:EE:FF"
         mock_ble_device.name = "Hatch Rest"
@@ -105,6 +112,10 @@ class TestAsyncSetupEntry:
         mock_api.power = None
         mock_api.sound = None
         mock_api.volume = None
+        mock_api.timer_total = None
+        mock_api.timer_remaining = None
+        mock_api._timer_expires_at = None
+        # Device is unreachable: any refresh would raise. Setup must not call it.
         mock_api.refresh_data = AsyncMock(side_effect=Exception("Connection failed"))
 
         with patch(
@@ -119,8 +130,17 @@ class TestAsyncSetupEntry:
                     "custom_components.hatch_rest.coordinator.bluetooth.async_register_callback",
                     return_value=MagicMock(),
                 ):
-                    with pytest.raises(ConfigEntryNotReady):
-                        await async_setup_entry(hass, mock_entry)
+                    with patch(
+                        "homeassistant.config_entries.ConfigEntries.async_forward_entry_setups",
+                        new_callable=AsyncMock,
+                    ) as mock_forward:
+                        result = await async_setup_entry(hass, mock_entry)
+
+        assert result is True
+        assert mock_entry.runtime_data is not None
+        mock_forward.assert_called_once()
+        # Setup must not have awaited a blocking refresh against the dead device.
+        mock_api.refresh_data.assert_not_called()
 
 
 class TestAsyncUnloadEntry:

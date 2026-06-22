@@ -8,11 +8,11 @@ Reverse-engineered from btsnoop captures of the official Hatch app communicating
 
 | Name | UUID | Direction | Purpose |
 |---|---|---|---|
-| `CHAR_TX` | `02240002-5efd-47eb-9c1a-de53f7a2b232` | Write (no response) | Send commands to device |
+| `CHAR_TX` | `02240002-5efd-47eb-9c1a-de53f7a2b232` | Write | Send commands to device |
 | `CHAR_LIST` | `02240003-5efd-47eb-9c1a-de53f7a2b232` | Notify | Config channel — favorites, schedules, timer, GF index |
 | `CHAR_FEEDBACK` | `02260002-5efd-47eb-9c1a-de53f7a2b232` | Notify / Read | State channel — power, color, sound, volume |
 
-All writes to `CHAR_TX` must use **write-without-response** (`response=False`). The device does not support GATT write-with-response on this characteristic.
+`CHAR_TX` accepts both GATT write modes. The integration sends **user command writes with response** (`response=True`) — power, sound, volume, color, favorite select, timer (`SI`/`SN`/`SV`/`SC`/`SP`/`SD`), plus the `GI`/`GD` timer queries in `refresh_data` — and sends the **query/sweep path without response** (`response=False`): the `GF` index query, the once-per-session `PGB`/`EGB` slot fetches, and the clock-sync `ST` write. This split is the integration's convention, not a device constraint; the code in `api.py` is the source of truth for which mode each write uses.
 
 ---
 
@@ -149,7 +149,7 @@ Setting color to `FEFEFE` activates gradient/rainbow mode.
 |---|---|
 | `ST{YYYYMMDDHHmmss}U` | Set device clock. e.g. `ST20260420100000U` |
 
-Sent on every connection.
+Sent at most once per calendar day, and only on a connection after 02:30 local time (the 02:30 gate keeps DST transitions, which occur at 02:00, from being written with the wrong UTC offset). The device clock only drives the onboard scheduler; HA scenes and automations are unaffected by it.
 
 ### Miscellaneous
 
@@ -178,5 +178,6 @@ Sent on every connection.
 
 - Commands are batched per 10-second idle window using a `_send_lock`.
 - The connection is held open while `_active_operations > 0`; a 10-second disconnect timer fires after all operations complete.
-- On connect: subscribe to `CHAR_LIST` first (to avoid missing the initial dump), then `CHAR_FEEDBACK`; send `GF`; sync clock; fetch PGB01–PGB06 and EGB01–EGB0A if cache is stale (default TTL: 10 min).
+- On connect: subscribe to `CHAR_LIST` first (to avoid missing the initial dump), then `CHAR_FEEDBACK`; send `GF`; sync clock (subject to the once-per-day / after-02:30 gate above); and, **only on the first connect of the integration load**, fetch PGB01–PGB06 and EGB01–EGB0A. The favorites/schedules sweep runs once per `PyHatchBabyRestAsync` lifetime (`_has_fetched_full`), not on a stale-cache TTL — reload the integration to re-fetch after editing favorites/schedules in the Hatch app.
 - Favorites cache is updated **in-place** on reconnect — never cleared — so toggle commands can read existing slot data even while fresh PGB responses are still arriving.
+- Background polling defaults to **60 minutes** (`DEFAULT_SCAN_INTERVAL`); state is intended to arrive primarily via BLE advertisements and optimistic command updates, with the poll as a slow safety net.
