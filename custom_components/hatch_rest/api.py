@@ -74,8 +74,11 @@ class PyHatchBabyRestAsync:
         # timer state
         self.timer_total: int | None = None
         self._timer_expires_at: float | None = None
-        
-        self.full_refresh_interval: int = 600 # seconds
+
+        # Favorites/schedules are fetched once per integration load (i.e. once per
+        # PyHatchBabyRestAsync lifetime). Subsequent reconnects skip the sweep.
+        # To pick up Hatch-app changes, reload the integration in HA.
+        self._has_fetched_full: bool = False
 
         self._init_collections()
 
@@ -112,7 +115,6 @@ class PyHatchBabyRestAsync:
         self._egb_fetch: _SlotFetch | None = None  # in-flight EGB fetch during initial sweep
         self._pending_pgb_slots: deque[int] = deque()  # slots queued from toggle_favorite
         self._pending_egb_slots: deque[int] = deque()  # slots queued from toggle_schedule
-        self._last_full_fetch: float | None = None  # monotonic time of last PGB+EGB sweep
         self._pending_gf: bool = False  # True while waiting for a GF index response
 
     def update_ble_device(self, ble_device: BLEDevice) -> None:
@@ -261,18 +263,15 @@ class PyHatchBabyRestAsync:
                     #     CHAR_TX, bytearray(clock_cmd, "utf-8"), response=False
                     # )
 
-                    fetch_age = monotonic() - self._last_full_fetch if self._last_full_fetch else None
-                    if fetch_age is None or fetch_age > self.full_refresh_interval:
-                        _LOGGER.debug("Fetching favorites and schedules (age=%s)", fetch_age)
+                    if not self._has_fetched_full:
+                        _LOGGER.debug("Fetching favorites and schedules (first connect this session)")
                         # Update in-place — don't clear, so toggle_favorite can still read
                         # existing cache while the fresh PGB/EGB responses arrive.
-
                         await self._fetch_favorites(client)
                         await self._fetch_schedules(client)
-
-                        self._last_full_fetch = monotonic()
+                        self._has_fetched_full = True
                     else:
-                        _LOGGER.debug("Skipping favorites/schedules fetch (age=%.0fs)", fetch_age)
+                        _LOGGER.debug("Skipping favorites/schedules fetch (already fetched this session)")
                 except Exception as e:
                     if "already notifying" not in str(e):
                         _LOGGER.warning("Notification error: %r", e)

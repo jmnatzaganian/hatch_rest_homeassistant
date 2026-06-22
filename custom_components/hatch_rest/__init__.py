@@ -43,9 +43,6 @@ async def async_setup_entry(
             f"Could not find Hatch Rest device with address {address}"
         )
     hatch_rest_device = PyHatchBabyRestAsync(ble_device)
-    hatch_rest_device.full_refresh_interval = (
-        scan_interval_min * 60
-    )  # convert to seconds
     coordinator = HatchBabyRestUpdateCoordinator(
         hass,
         entry.unique_id,
