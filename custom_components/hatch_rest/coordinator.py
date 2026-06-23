@@ -91,13 +91,13 @@ class HatchBabyRestUpdateCoordinator(DataUpdateCoordinator):
 
         @callback
         def _fire(_now):
-            self.hass.async_create_task(self._debounced_refresh())
+            self.hass.async_create_task(self._do_deep_refresh())
 
         # 10s debounce to let manual/app changes settle before HA connects
         self._refresh_timer = async_call_later(self.hass, 10, _fire)
         _LOGGER.debug("Scheduled debounced deep refresh in 10s")
 
-    async def _debounced_refresh(self) -> None:
+    async def _do_deep_refresh(self) -> None:
         """Perform the debounced refresh."""
         self._refresh_timer = None
         # Don't trigger if we are already communicating with the device
