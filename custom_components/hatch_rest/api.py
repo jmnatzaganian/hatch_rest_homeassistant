@@ -16,6 +16,7 @@ import struct
 from time import monotonic
 
 from bleak.backends.device import BLEDevice
+from bleak.exc import BleakDBusError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakConnectionError,
@@ -180,6 +181,17 @@ class PyHatchBabyRestAsync:
         await self._client_connect()
         try:
             yield self._client
+        except BleakDBusError as e:
+            # The GATT characteristic D-Bus object no longer exists — BlueZ dropped the
+            # connection internally but didn't fire a disconnect event. Clear the client
+            # immediately so the next call to _client_connect() makes a fresh connection
+            # instead of reusing the stale handle.
+            _LOGGER.warning("Operation error (stale BLE handle, resetting client): %r", e)
+            self._client = None
+            self._is_notifying = False
+            if self._disconnect_timer:
+                self._disconnect_timer.cancel()
+                self._disconnect_timer = None
         except Exception as e:
             _LOGGER.warning("Operation error: %r", e)
         finally:
@@ -349,6 +361,10 @@ class PyHatchBabyRestAsync:
                 await self._client.disconnect()
             except Exception as e:  # noqa: BLE001
                 _LOGGER.warning("Exception during _client_disconnect -- %r", e)
+                # Disconnect failed (wedged BlueZ stack). Clear the client reference so the
+                # next _client_connect() establishes a fresh connection rather than reusing
+                # the stale handle, which would produce endless WriteValue/TimeoutError loops.
+                self._client = None
         else:
             _LOGGER.debug(
                 "self._client = %s and self._active_operations = %d, cannot currently disconnect",
