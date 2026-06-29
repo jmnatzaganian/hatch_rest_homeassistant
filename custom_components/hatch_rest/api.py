@@ -16,7 +16,7 @@ import struct
 from time import monotonic
 
 from bleak.backends.device import BLEDevice
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakDBusError, BleakError
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     BleakConnectionError,
@@ -192,6 +192,16 @@ class PyHatchBabyRestAsync:
             if self._disconnect_timer:
                 self._disconnect_timer.cancel()
                 self._disconnect_timer = None
+        except BleakError as e:
+            # Non-DBus BLE errors (GATT_ERROR 133, Invalid handle, Insufficient
+            # authorization) also leave the connection in a broken state — clear the
+            # client so the next _client_connect() makes a fresh establish_connection.
+            _LOGGER.warning("Operation error (BLE error, resetting client): %r", e)
+            self._client = None
+            self._is_notifying = False
+            if self._disconnect_timer:
+                self._disconnect_timer.cancel()
+                self._disconnect_timer = None
         except Exception as e:
             _LOGGER.warning("Operation error: %r", e)
         finally:
@@ -313,6 +323,14 @@ class PyHatchBabyRestAsync:
                 except Exception as e:
                     if "already notifying" not in str(e):
                         _LOGGER.warning("Notification error: %r", e)
+                        # Connection is unusable — tear it down so the next
+                        # _client_connect() call makes a fresh establish_connection
+                        # instead of short-circuiting on is_connected == True.
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                        client = None
 
         except Exception as e:
             _LOGGER.warning("Connect error: %r", e)
