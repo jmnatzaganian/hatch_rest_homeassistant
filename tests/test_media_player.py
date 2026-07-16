@@ -226,3 +226,40 @@ class TestHatchBabyRestMediaPlayer:
         await media_player_entity.async_media_play()
 
         media_player_entity._hatch_rest_device.set_sound.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_media_pause_with_unrecognized_sound(
+        self, media_player_entity: HatchBabyRestMediaPlayer
+    ):
+        """Test pause does not cache an unrecognized raw sound value."""
+        media_player_entity._previous_sound = PyHatchBabyRestSound.rain
+        media_player_entity._hatch_rest_device.sound = 67  # unmapped raw value
+        media_player_entity._hatch_rest_device.set_sound = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.get_current_data = lambda: {
+            "sound": PyHatchBabyRestSound.none
+        }
+
+        await media_player_entity.async_media_pause()
+
+        # Previously cached, valid sound is preserved rather than overwritten
+        # with the unrecognized value.
+        assert media_player_entity._previous_sound == PyHatchBabyRestSound.rain
+        media_player_entity._hatch_rest_device.set_sound.assert_called_once_with(
+            PyHatchBabyRestSound.none
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_media_play_with_unrecognized_previous_sound(
+        self, media_player_entity: HatchBabyRestMediaPlayer
+    ):
+        """Test play does not raise when the previous sound is unrecognized."""
+        media_player_entity._previous_sound = 113  # unmapped raw value
+        media_player_entity._hatch_rest_device.power = True
+        media_player_entity._hatch_rest_device.set_sound = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.get_current_data = lambda: {"sound": 113}
+
+        await media_player_entity.async_media_play()
+
+        media_player_entity._hatch_rest_device.set_sound.assert_not_called()

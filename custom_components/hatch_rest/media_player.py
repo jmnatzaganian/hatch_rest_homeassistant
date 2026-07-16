@@ -166,7 +166,15 @@ class HatchBabyRestMediaPlayer(HatchBabyRestEntity, MediaPlayerEntity):  # pyrig
 
     async def async_media_pause(self) -> None:
         """Pause the media player."""
-        self._previous_sound = self._hatch_rest_device.sound
+        current_sound = self._hatch_rest_device.sound
+        if hasattr(current_sound, "name"):
+            self._previous_sound = current_sound
+        else:
+            _LOGGER.warning(
+                "media_player pause: device reported unrecognized sound value "
+                "%s; keeping previous resumable sound instead",
+                current_sound,
+            )
         _LOGGER.debug(
             "media_player setting source = %d (%s)",
             PyHatchBabyRestSound.none,
@@ -185,12 +193,20 @@ class HatchBabyRestMediaPlayer(HatchBabyRestEntity, MediaPlayerEntity):  # pyrig
             _LOGGER.debug("media_player _hatch_rest_device power not on -- turning on")
             await self._hatch_rest_device.turn_power_on()
         if previous_sound := self._previous_sound:
-            _LOGGER.debug(
-                "media_player setting source = %d (%s)",
-                previous_sound,
-                PyHatchBabyRestSound(previous_sound).name,
-            )
-            await self._hatch_rest_device.set_sound(previous_sound)
+            try:
+                sound_name = PyHatchBabyRestSound(previous_sound).name
+            except ValueError:
+                _LOGGER.error(
+                    "media_player cannot resume unrecognized sound value %s; skipping",
+                    previous_sound,
+                )
+            else:
+                _LOGGER.debug(
+                    "media_player setting source = %d (%s)",
+                    previous_sound,
+                    sound_name,
+                )
+                await self._hatch_rest_device.set_sound(previous_sound)
 
         # https://developers.home-assistant.io/docs/integration_fetching_data/
         # If this method is used on a coordinator that polls, it will reset the time until the next time it will poll for data.
