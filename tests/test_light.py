@@ -1,6 +1,6 @@
 """Tests for Hatch Rest light entity."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.components.light import ATTR_BRIGHTNESS, ATTR_RGB_COLOR
@@ -139,7 +139,7 @@ class TestHatchBabyRestLight:
     async def test_turn_on_updates_coordinator(self, light_entity: HatchBabyRestLight):
         """Test turn_on updates coordinator data."""
         light_entity._hatch_rest_device.power = True
-        light_entity.coordinator.async_set_updated_data = AsyncMock()
+        light_entity.coordinator.async_set_updated_data = MagicMock()
         light_entity.coordinator.get_current_data = lambda: {"brightness": 100}
 
         await light_entity.async_turn_on()
@@ -152,7 +152,7 @@ class TestHatchBabyRestLight:
     async def test_turn_off_updates_coordinator(self, light_entity: HatchBabyRestLight):
         """Test turn_off updates coordinator data."""
         light_entity._hatch_rest_device.set_brightness = AsyncMock()
-        light_entity.coordinator.async_set_updated_data = AsyncMock()
+        light_entity.coordinator.async_set_updated_data = MagicMock()
         light_entity.coordinator.get_current_data = lambda: {"brightness": 0}
 
         await light_entity.async_turn_off()

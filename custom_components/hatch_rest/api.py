@@ -27,6 +27,17 @@ from .const import CHAR_FEEDBACK, CHAR_LIST, CHAR_TX, PyHatchBabyRestSound
 
 _LOGGER = logging.getLogger(__name__)
 
+# Upper bounds on the two internal waits that would otherwise be unbounded.
+# Home Assistant service calls have no timeout of their own, so anything that
+# blocks forever in here hangs the calling script forever too (a `mode: single`
+# automation is then wedged permanently, not just for one run).
+#
+# Both values are deliberately generous: they exist to break deadlocks, not to
+# cut short slow-but-working BLE. A full failing establish_connection is roughly
+# 4 attempts x 20s, so a legitimate connect can take well over a minute.
+CONNECT_WAIT_TIMEOUT = 120.0
+SEND_LOCK_TIMEOUT = 180.0
+
 
 class _SlotFetch:
     """Pairs a slot index with an asyncio.Event so the fetch loop can await the notification."""
@@ -174,12 +185,42 @@ class PyHatchBabyRestAsync:
             callback()
 
     @asynccontextmanager
+    async def _send_lock_guard(self, operation: str):
+        """Acquire the send lock with an upper bound.
+
+        Yields True when the lock was acquired and False when it timed out. A
+        caller that times out skips its operation rather than queueing behind a
+        wedged holder indefinitely, matching how the rest of this module treats
+        an unusable connection (warn and no-op).
+        """
+        try:
+            await asyncio.wait_for(
+                self._send_lock.acquire(), timeout=SEND_LOCK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Timed out after %ss acquiring the send lock for %s; skipping",
+                SEND_LOCK_TIMEOUT,
+                operation,
+            )
+            yield False
+            return
+
+        try:
+            yield True
+        finally:
+            self._send_lock.release()
+
+    @asynccontextmanager
     async def _active_operation(self):
         """Context manager that tracks an in-flight operation and schedules disconnect on exit."""
         self._active_operations += 1
         _LOGGER.debug("Active operations: %d", self._active_operations)
-        await self._client_connect()
         try:
+            # Inside the try so a raising or cancelled connect still runs the
+            # finally below — otherwise the counter leaks and _schedule_disconnect
+            # is never armed, leaving the client connected indefinitely.
+            await self._client_connect()
             yield self._client
         except BleakDBusError as e:
             # The GATT characteristic D-Bus object no longer exists — BlueZ dropped the
@@ -251,11 +292,26 @@ class PyHatchBabyRestAsync:
                 return
 
             if self._connecting:
-                await self._connection_cv.wait()
+                # Bounded: if the connecting task ever fails to clear the flag,
+                # an unbounded wait here would block this caller forever.
+                try:
+                    await asyncio.wait_for(
+                        self._connection_cv.wait(), timeout=CONNECT_WAIT_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    # Condition.wait() re-acquires the lock before propagating,
+                    # so it is safe to touch _connecting here.
+                    _LOGGER.warning(
+                        "Timed out after %ss waiting for an in-flight connect; "
+                        "clearing the connecting flag so the next call can retry",
+                        CONNECT_WAIT_TIMEOUT,
+                    )
+                    self._connecting = False
                 return
 
             self._connecting = True
 
+        client = None
         try:
             client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -335,11 +391,16 @@ class PyHatchBabyRestAsync:
         except Exception as e:
             _LOGGER.warning("Connect error: %r", e)
             client = None
-
-        async with self._connection_cv:
-            self._connecting = False
-            self._client = client
-            self._connection_cv.notify_all()
+        finally:
+            # MUST run even when this task is cancelled. asyncio.CancelledError is
+            # a BaseException, so the `except Exception` above does not catch it;
+            # without this `finally` a cancellation here leaves _connecting True
+            # forever and every subsequent caller blocks on the condition variable
+            # that is now never notified.
+            async with self._connection_cv:
+                self._connecting = False
+                self._client = client
+                self._connection_cv.notify_all()
 
     def _schedule_disconnect(self) -> None:
         """Schedule a disconnection after a cooldown period."""
@@ -408,7 +469,10 @@ class PyHatchBabyRestAsync:
         :param pgb_slot: Favorite slot index expected in the PGB response (enqueued inside lock).
         :param egb_slot: Schedule slot index expected in the EGB response (enqueued inside lock).
         """
-        async with self._send_lock:
+        async with self._send_lock_guard("_send_commands") as acquired:
+            if not acquired:
+                return
+
             if log_timing := _LOGGER.isEnabledFor(logging.DEBUG):
                 start = monotonic()
                 _LOGGER.debug("Started batch _send_commands at %s", datetime.now().isoformat())
@@ -739,7 +803,10 @@ class PyHatchBabyRestAsync:
 
     async def refresh_data(self):
         """Refresh data from Hatch Rest device."""
-        async with self._send_lock:
+        async with self._send_lock_guard("refresh_data") as acquired:
+            if not acquired:
+                return
+
             if log_timing := _LOGGER.isEnabledFor(logging.DEBUG):
                 start = monotonic()
                 _LOGGER.debug("Started refresh_data at %s", datetime.now().isoformat())

@@ -1,5 +1,6 @@
 """Tests for Hatch Rest API."""
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -60,6 +61,12 @@ class TestPyHatchBabyRestAsync:
         """Test successful client connection."""
         mock_client = MagicMock()
         mock_client.is_connected = True
+        # start_notify/write_gatt_char are awaited during connect, so they must be
+        # AsyncMock. With a plain MagicMock the await raises TypeError, the code
+        # tears the connection down as unusable, and this test silently exercised
+        # the failure path instead of the success path.
+        mock_client.start_notify = AsyncMock()
+        mock_client.write_gatt_char = AsyncMock()
 
         with patch(
             "custom_components.hatch_rest.api.establish_connection",
@@ -70,6 +77,8 @@ class TestPyHatchBabyRestAsync:
                 with patch.object(api, "_fetch_schedules", new_callable=AsyncMock):
                     await api._client_connect()
                     assert api._client == mock_client
+                    assert api._is_notifying is True
+                    assert api._connecting is False
 
     @pytest.mark.asyncio
     async def test_client_connect_failure(self, api: PyHatchBabyRestAsync):
@@ -336,4 +345,128 @@ class TestPyHatchBabyRestAsync:
 
     def test_active_operations_starts_at_zero(self, api: PyHatchBabyRestAsync):
         """Test active operations counter initializes to zero."""
+        assert api._active_operations == 0
+
+
+class TestConnectionDeadlocks:
+    """Regression tests for the unbounded waits in the connect/send paths.
+
+    A wedged wait here has no user-visible timeout: an HA service call blocks
+    forever, and a `mode: single` automation that made the call stays "running"
+    permanently, silently skipping every subsequent trigger.
+    """
+
+    @pytest.fixture
+    def api(self, mock_ble_device: BLEDevice) -> PyHatchBabyRestAsync:
+        """Create API instance."""
+        api = PyHatchBabyRestAsync(mock_ble_device)
+        yield api
+        if api._disconnect_timer:
+            api._disconnect_timer.cancel()
+            api._disconnect_timer = None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_clears_connecting_flag(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """A cancelled connect must still clear _connecting and notify waiters.
+
+        asyncio.CancelledError is a BaseException, so `except Exception` misses
+        it; only a `finally` keeps the flag from sticking True forever.
+        """
+        started = asyncio.Event()
+
+        async def _hang(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(3600)
+
+        with patch("custom_components.hatch_rest.api.establish_connection", new=_hang):
+            task = asyncio.create_task(api._client_connect())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            assert api._connecting is True
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert api._connecting is False
+        assert api._client is None
+
+    @pytest.mark.asyncio
+    async def test_waiter_does_not_block_forever_on_stuck_flag(
+        self, api: PyHatchBabyRestAsync, monkeypatch
+    ):
+        """A caller must give up rather than wait on a notify that never comes."""
+        monkeypatch.setattr(
+            "custom_components.hatch_rest.api.CONNECT_WAIT_TIMEOUT", 0.01
+        )
+        api._connecting = True  # a connecting task that will never notify
+
+        await asyncio.wait_for(api._client_connect(), timeout=5)
+
+        # Flag cleared so the next caller retries instead of wedging too.
+        assert api._connecting is False
+
+    @pytest.mark.asyncio
+    async def test_send_lock_guard_yields_false_on_timeout(
+        self, api: PyHatchBabyRestAsync, monkeypatch
+    ):
+        """The guard reports failure instead of queueing behind a wedged holder."""
+        monkeypatch.setattr("custom_components.hatch_rest.api.SEND_LOCK_TIMEOUT", 0.01)
+        await api._send_lock.acquire()
+        try:
+            async with api._send_lock_guard("test") as acquired:
+                assert acquired is False
+        finally:
+            api._send_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_send_lock_guard_releases_lock_on_success(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """The happy path still acquires and releases normally."""
+        async with api._send_lock_guard("test") as acquired:
+            assert acquired is True
+            assert api._send_lock.locked()
+        assert not api._send_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_send_commands_skips_when_lock_wedged(
+        self, api: PyHatchBabyRestAsync, monkeypatch
+    ):
+        """_send_commands returns instead of hanging the calling service call."""
+        monkeypatch.setattr("custom_components.hatch_rest.api.SEND_LOCK_TIMEOUT", 0.01)
+        await api._send_lock.acquire()
+        try:
+            with patch.object(
+                api, "_client_connect", new_callable=AsyncMock
+            ) as mock_connect:
+                await asyncio.wait_for(api._send_commands(["SI"]), timeout=5)
+                mock_connect.assert_not_called()
+        finally:
+            api._send_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_active_operations_released_when_connect_cancelled(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """A cancelled connect inside _active_operation must not leak the counter."""
+
+        async def _hang():
+            await asyncio.sleep(3600)
+
+        with patch.object(api, "_client_connect", side_effect=_hang):
+
+            async def _run():
+                async with api._active_operation():
+                    pass
+
+            task = asyncio.create_task(_run())
+            await asyncio.sleep(0.05)
+            assert api._active_operations == 1
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
         assert api._active_operations == 0
