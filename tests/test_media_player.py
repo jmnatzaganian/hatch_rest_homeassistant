@@ -1,6 +1,6 @@
 """Tests for Hatch Rest media player entity."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.components.media_player import MediaPlayerDeviceClass
@@ -117,7 +117,7 @@ class TestHatchBabyRestMediaPlayer:
     ):
         """Test setting volume level."""
         media_player_entity._hatch_rest_device.set_volume = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {"volume": 128}
 
         await media_player_entity.async_set_volume_level(0.5)
@@ -130,7 +130,7 @@ class TestHatchBabyRestMediaPlayer:
     ):
         """Test setting volume to max."""
         media_player_entity._hatch_rest_device.set_volume = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {"volume": 255}
 
         await media_player_entity.async_set_volume_level(1.0)
@@ -143,7 +143,7 @@ class TestHatchBabyRestMediaPlayer:
     ):
         """Test selecting a source."""
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {
             "sound": PyHatchBabyRestSound.rain
         }
@@ -162,7 +162,7 @@ class TestHatchBabyRestMediaPlayer:
         """Test pausing media."""
         media_player_entity._hatch_rest_device.sound = PyHatchBabyRestSound.ocean
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {
             "sound": PyHatchBabyRestSound.none
         }
@@ -183,7 +183,7 @@ class TestHatchBabyRestMediaPlayer:
         media_player_entity._previous_sound = PyHatchBabyRestSound.rain
         media_player_entity._hatch_rest_device.power = True
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {
             "sound": PyHatchBabyRestSound.rain
         }
@@ -203,7 +203,7 @@ class TestHatchBabyRestMediaPlayer:
         media_player_entity._hatch_rest_device.power = False
         media_player_entity._hatch_rest_device.turn_power_on = AsyncMock()
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {
             "sound": PyHatchBabyRestSound.ocean
         }
@@ -220,7 +220,7 @@ class TestHatchBabyRestMediaPlayer:
         media_player_entity._previous_sound = None
         media_player_entity._hatch_rest_device.power = True
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {"sound": None}
 
         await media_player_entity.async_media_play()
@@ -235,7 +235,7 @@ class TestHatchBabyRestMediaPlayer:
         media_player_entity._previous_sound = PyHatchBabyRestSound.rain
         media_player_entity._hatch_rest_device.sound = 67  # unmapped raw value
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {
             "sound": PyHatchBabyRestSound.none
         }
@@ -257,7 +257,7 @@ class TestHatchBabyRestMediaPlayer:
         media_player_entity._previous_sound = 113  # unmapped raw value
         media_player_entity._hatch_rest_device.power = True
         media_player_entity._hatch_rest_device.set_sound = AsyncMock()
-        media_player_entity.coordinator.async_set_updated_data = AsyncMock()
+        media_player_entity.coordinator.async_set_updated_data = MagicMock()
         media_player_entity.coordinator.get_current_data = lambda: {"sound": 113}
 
         await media_player_entity.async_media_play()
