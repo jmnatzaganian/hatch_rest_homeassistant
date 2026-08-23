@@ -33,6 +33,16 @@ class TestHelperFunctions:
 class TestHatchBabyRestConfigFlow:
     """Tests for HatchBabyRestConfigFlow."""
 
+    @pytest.fixture(autouse=True)
+    def _enable_bluetooth(self, enable_bluetooth):
+        """Stand up the mocked bluetooth stack.
+
+        These tests drive a real config flow, so HA resolves hatch_rest's
+        `bluetooth_adapters` dependency for real. Without this the `bluetooth`
+        component tries to reach BlueZ over a socket and pytest-socket blocks it.
+        """
+        return
+
     @pytest.fixture
     def mock_setup_entry(self) -> AsyncMock:
         """Mock async_setup_entry."""

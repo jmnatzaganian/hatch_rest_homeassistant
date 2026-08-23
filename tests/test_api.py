@@ -61,6 +61,12 @@ class TestPyHatchBabyRestAsync:
         """Test successful client connection."""
         mock_client = MagicMock()
         mock_client.is_connected = True
+        # start_notify/write_gatt_char are awaited during connect, so they must be
+        # AsyncMock. With a plain MagicMock the await raises TypeError, the code
+        # tears the connection down as unusable, and this test silently exercised
+        # the failure path instead of the success path.
+        mock_client.start_notify = AsyncMock()
+        mock_client.write_gatt_char = AsyncMock()
 
         with patch(
             "custom_components.hatch_rest.api.establish_connection",
@@ -71,6 +77,8 @@ class TestPyHatchBabyRestAsync:
                 with patch.object(api, "_fetch_schedules", new_callable=AsyncMock):
                     await api._client_connect()
                     assert api._client == mock_client
+                    assert api._is_notifying is True
+                    assert api._connecting is False
 
     @pytest.mark.asyncio
     async def test_client_connect_failure(self, api: PyHatchBabyRestAsync):
