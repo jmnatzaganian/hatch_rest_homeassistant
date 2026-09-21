@@ -7,7 +7,7 @@ https://github.com/kjoconnor/pyhatchbabyrest/blob/master/LICENSE
 """
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime
@@ -38,6 +38,71 @@ _LOGGER = logging.getLogger(__name__)
 CONNECT_WAIT_TIMEOUT = 120.0
 SEND_LOCK_TIMEOUT = 180.0
 
+# Upper bound on one operation while it HOLDS the send lock. The two timeouts
+# above only bound callers waiting for the lock; they do nothing about a holder
+# that never returns. In September 2026 a refresh_data() stuck inside the lock
+# for five days (no BLE connection open, waiting on a future that never
+# resolved), and every command to that unit timed out behind it.
+#
+# Must stay below SEND_LOCK_TIMEOUT so a caller queued behind an abandoned
+# holder still gets the lock instead of timing out too.
+OPERATION_TIMEOUT = 150.0
+
+# How long to give an abandoned operation to honour its cancellation before
+# the lock is released regardless.
+ABANDON_GRACE = 5.0
+
+# Bound on the best-effort cleanup calls (cache clear, disconnect) made while
+# tearing down a connection that has already failed.
+CLEANUP_TIMEOUT = 10.0
+
+
+def _describe_await_chain(task: asyncio.Task) -> str:
+    """Return the chain of awaits a task is currently suspended in.
+
+    asyncio's own Task repr shows only the outermost coroutine, which is not
+    enough to tell which library call never returned. Walking cr_await gives
+    the full chain down to the leaf.
+
+    An @asynccontextmanager step (e.g. the connect inside _active_operation)
+    awaits an opaque async_generator_asend object with no link to its
+    generator; the walk steps over it via the context manager's `gen`.
+    """
+    frames = []
+    obj = task.get_coro()
+    prev_frame = None
+    while obj is not None and len(frames) < 50:
+        frame = (
+            getattr(obj, "cr_frame", None)
+            or getattr(obj, "gi_frame", None)
+            or getattr(obj, "ag_frame", None)
+        )
+        if frame is None:
+            owner = prev_frame.f_locals.get("self") if prev_frame is not None else None
+            gen = getattr(owner, "gen", None)
+            if gen is not None and getattr(gen, "ag_frame", None) is not None:
+                prev_frame = None
+                obj = gen
+                continue
+            frames.append(repr(obj))
+        else:
+            frames.append(
+                f"{frame.f_code.co_name} ({frame.f_code.co_filename}:{frame.f_lineno})"
+            )
+        prev_frame = frame
+        obj = (
+            getattr(obj, "cr_await", None)
+            or getattr(obj, "gi_yieldfrom", None)
+            or getattr(obj, "ag_await", None)
+        )
+    return " -> ".join(frames) if frames else "<unknown>"
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    """Retrieve an abandoned task's outcome so asyncio does not log it as lost."""
+    if not task.cancelled():
+        task.exception()
+
 
 class _SlotFetch:
     """Pairs a slot index with an asyncio.Event so the fetch loop can await the notification."""
@@ -67,6 +132,19 @@ class PyHatchBabyRestAsync:
 
         self._client: BleakClientWithServiceCache | None = None
         self._active_operations: int = 0
+        # Bumped when a stuck operation is abandoned. An _active_operation that
+        # started under an older generation must not decrement the counter if
+        # it ever finishes, because the abandon already reset it.
+        self._operation_generation: int = 0
+        # Last step reached by the current locked operation. Logged when an
+        # operation is abandoned, because the await chain cannot see inside
+        # the @asynccontextmanager connect step.
+        self._stage: str = "idle"
+        # Set when a notification subscribe failed in a way that points at a
+        # stale GATT service cache; _active_operation then retries once.
+        self._retry_connect: bool = False
+        # Strong references to background cleanup tasks (asyncio keeps only weak ones).
+        self._cleanup_tasks: set[asyncio.Task] = set()
 
         # connection synchronization primitizes / state
         self._connection_cv = asyncio.Condition()
@@ -199,7 +277,8 @@ class PyHatchBabyRestAsync:
             )
         except asyncio.TimeoutError:
             _LOGGER.warning(
-                "Timed out after %ss acquiring the send lock for %s; skipping",
+                "%s: Timed out after %ss acquiring the send lock for %s; skipping",
+                self.address,
                 SEND_LOCK_TIMEOUT,
                 operation,
             )
@@ -211,23 +290,127 @@ class PyHatchBabyRestAsync:
         finally:
             self._send_lock.release()
 
+    async def _run_locked(
+        self, operation: str, body: Callable[[], Awaitable[None]]
+    ) -> None:
+        """Run body under the send lock, bounded by OPERATION_TIMEOUT.
+
+        body runs in its own task so that a hang anywhere inside it (our code
+        or a BLE library) cannot hold the lock forever. On timeout the task is
+        cancelled and abandoned, connection state is reset, and the lock is
+        released so later commands can proceed.
+        """
+        async with self._send_lock_guard(operation) as acquired:
+            if not acquired:
+                return
+
+            self._stage = f"{operation}: start"
+            task = asyncio.create_task(
+                body(), name=f"hatch_rest {self.address} {operation}"
+            )
+            try:
+                done, _ = await asyncio.wait({task}, timeout=OPERATION_TIMEOUT)
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+
+            if task in done:
+                self._stage = "idle"
+                task.result()  # re-raise anything the body raised
+                return
+
+            self._abandon_operation(task, operation)
+            # Let a well-behaved task unwind (and run its finally blocks) before
+            # the next holder starts. A task that swallows the cancellation is
+            # simply left behind.
+            await asyncio.wait({task}, timeout=ABANDON_GRACE)
+
+    def _abandon_operation(self, task: asyncio.Task, operation: str) -> None:
+        """Cancel a stuck locked operation and reset connection state."""
+        _LOGGER.warning(
+            "%s: %s did not finish within %ss (last stage: %s); abandoning it and "
+            "releasing the send lock. Stuck at: %s",
+            self.address,
+            operation,
+            OPERATION_TIMEOUT,
+            self._stage,
+            _describe_await_chain(task),
+        )
+        task.cancel()
+        task.add_done_callback(_consume_task_result)
+
+        # Everything below belonged to the abandoned task. Nothing else can be
+        # mid-operation, because every _active_operation runs under the lock.
+        self._operation_generation += 1
+        self._active_operations = 0
+        self._command_in_flight = False
+        self._connecting = False
+        self._is_notifying = False
+        self._retry_connect = False
+        self._pgb_fetch = None
+        self._egb_fetch = None
+        self._stage = "idle"
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
+        client, self._client = self._client, None
+        if client is not None:
+            cleanup = asyncio.create_task(self._disconnect_quietly(client))
+            self._cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._cleanup_tasks.discard)
+
+    async def _disconnect_quietly(self, client: BleakClientWithServiceCache) -> None:
+        """Best-effort, bounded disconnect of a client we have given up on."""
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=CLEANUP_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.debug("%s: disconnect of abandoned client failed: %r", self.address, e)
+
+    async def _clear_gatt_cache(self, client: BleakClientWithServiceCache) -> bool:
+        """Clear the cached GATT services for this device, bounded.
+
+        A stale service cache makes every connect fail the same way
+        (characteristic not found, invalid handle, GATT error on the subscribe)
+        until something clears it, and nothing else in the stack does.
+        """
+        try:
+            cleared = await asyncio.wait_for(client.clear_cache(), timeout=CLEANUP_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.debug("%s: clearing the GATT cache failed: %r", self.address, e)
+            return False
+        if cleared:
+            _LOGGER.info("%s: Cleared the GATT service cache; retrying the connect", self.address)
+        return bool(cleared)
+
     @asynccontextmanager
     async def _active_operation(self):
         """Context manager that tracks an in-flight operation and schedules disconnect on exit."""
+        generation = self._operation_generation
         self._active_operations += 1
         _LOGGER.debug("Active operations: %d", self._active_operations)
         try:
             # Inside the try so a raising or cancelled connect still runs the
             # finally below — otherwise the counter leaks and _schedule_disconnect
             # is never armed, leaving the client connected indefinitely.
+            self._retry_connect = False
             await self._client_connect()
+            if self._client is None and self._retry_connect:
+                # The subscribe failed and the GATT cache was cleared; one fresh
+                # connect with rediscovered services usually succeeds, and lets
+                # this command land instead of being dropped.
+                self._retry_connect = False
+                await self._client_connect()
+            self._retry_connect = False
             yield self._client
         except BleakDBusError as e:
             # The GATT characteristic D-Bus object no longer exists — BlueZ dropped the
             # connection internally but didn't fire a disconnect event. Clear the client
             # immediately so the next call to _client_connect() makes a fresh connection
             # instead of reusing the stale handle.
-            _LOGGER.warning("Operation error (stale BLE handle, resetting client): %r", e)
+            _LOGGER.warning(
+                "%s: Operation error (stale BLE handle, resetting client): %r", self.address, e
+            )
             self._client = None
             self._is_notifying = False
             if self._disconnect_timer:
@@ -237,18 +420,23 @@ class PyHatchBabyRestAsync:
             # Non-DBus BLE errors (GATT_ERROR 133, Invalid handle, Insufficient
             # authorization) also leave the connection in a broken state — clear the
             # client so the next _client_connect() makes a fresh establish_connection.
-            _LOGGER.warning("Operation error (BLE error, resetting client): %r", e)
+            _LOGGER.warning(
+                "%s: Operation error (BLE error, resetting client): %r", self.address, e
+            )
             self._client = None
             self._is_notifying = False
             if self._disconnect_timer:
                 self._disconnect_timer.cancel()
                 self._disconnect_timer = None
         except Exception as e:
-            _LOGGER.warning("Operation error: %r", e)
+            _LOGGER.warning("%s: Operation error: %r", self.address, e)
         finally:
-            self._active_operations -= 1
-            _LOGGER.debug("Active operations: %d", self._active_operations)
-            self._schedule_disconnect()
+            # An abandoned operation (see _abandon_operation) already had its
+            # count reset; decrementing again would drive the counter negative.
+            if generation == self._operation_generation:
+                self._active_operations -= 1
+                _LOGGER.debug("Active operations: %d", self._active_operations)
+                self._schedule_disconnect()
 
     def _client_disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Callback for when the client disconnects."""
@@ -311,8 +499,10 @@ class PyHatchBabyRestAsync:
 
             self._connecting = True
 
+        generation = self._operation_generation
         client = None
         try:
+            self._stage = "connect: establish_connection"
             client = await establish_connection(
                 BleakClientWithServiceCache,
                 self.device,
@@ -334,6 +524,7 @@ class PyHatchBabyRestAsync:
                 try:
                     # We subscribe to the CONFIG channel FIRST to ensure we don't miss the dump
                     _LOGGER.debug("Subscribing to config channel %s...", CHAR_LIST)
+                    self._stage = "connect: start_notify"
                     await client.start_notify(CHAR_LIST, self._notification_handler)
                     
                     _LOGGER.debug("Subscribing to feedback channel %s...", CHAR_FEEDBACK)
@@ -344,6 +535,7 @@ class PyHatchBabyRestAsync:
                     # GF returns the active favorite index. Then PGB01-PGB06
                     # fetches each slot's config+name. Both confirmed via btsnoop.
                     _LOGGER.debug("Requesting active favorite index via 'GF'")
+                    self._stage = "connect: handshake writes"
                     self._pending_gf = True
                     await client.write_gatt_char(
                         CHAR_TX, bytearray(b"GF"), response=False
@@ -369,6 +561,7 @@ class PyHatchBabyRestAsync:
 
                     if not self._has_fetched_full:
                         _LOGGER.debug("Fetching favorites and schedules (first connect this session)")
+                        self._stage = "connect: favorites/schedules fetch"
                         # Update in-place — don't clear, so toggle_favorite can still read
                         # existing cache while the fresh PGB/EGB responses arrive.
                         await self._fetch_favorites(client)
@@ -378,18 +571,23 @@ class PyHatchBabyRestAsync:
                         _LOGGER.debug("Skipping favorites/schedules fetch (already fetched this session)")
                 except Exception as e:
                     if "already notifying" not in str(e):
-                        _LOGGER.warning("Notification error: %r", e)
+                        _LOGGER.warning("%s: Notification error: %r", self.address, e)
+                        # A BLE-level failure here (characteristic not found,
+                        # invalid handle, GATT error on the subscribe) is what a
+                        # stale GATT service cache looks like, and it repeats on
+                        # every connect until the cache is cleared.
+                        if isinstance(e, BleakError):
+                            self._stage = "connect: clear GATT cache"
+                            self._retry_connect = await self._clear_gatt_cache(client)
                         # Connection is unusable — tear it down so the next
                         # _client_connect() call makes a fresh establish_connection
                         # instead of short-circuiting on is_connected == True.
-                        try:
-                            await client.disconnect()
-                        except Exception:
-                            pass
+                        self._stage = "connect: disconnect after error"
+                        await self._disconnect_quietly(client)
                         client = None
 
         except Exception as e:
-            _LOGGER.warning("Connect error: %r", e)
+            _LOGGER.warning("%s: Connect error: %r", self.address, e)
             client = None
         finally:
             # MUST run even when this task is cancelled. asyncio.CancelledError is
@@ -398,9 +596,16 @@ class PyHatchBabyRestAsync:
             # forever and every subsequent caller blocks on the condition variable
             # that is now never notified.
             async with self._connection_cv:
-                self._connecting = False
-                self._client = client
-                self._connection_cv.notify_all()
+                if generation == self._operation_generation:
+                    self._connecting = False
+                    self._client = client
+                    self._connection_cv.notify_all()
+                elif client is not None:
+                    # This connect belonged to an operation that was abandoned
+                    # while it ran; do not let it overwrite the current state.
+                    cleanup = asyncio.create_task(self._disconnect_quietly(client))
+                    self._cleanup_tasks.add(cleanup)
+                    cleanup.add_done_callback(self._cleanup_tasks.discard)
 
     def _schedule_disconnect(self) -> None:
         """Schedule a disconnection after a cooldown period."""
@@ -469,10 +674,8 @@ class PyHatchBabyRestAsync:
         :param pgb_slot: Favorite slot index expected in the PGB response (enqueued inside lock).
         :param egb_slot: Schedule slot index expected in the EGB response (enqueued inside lock).
         """
-        async with self._send_lock_guard("_send_commands") as acquired:
-            if not acquired:
-                return
 
+        async def _body() -> None:
             if log_timing := _LOGGER.isEnabledFor(logging.DEBUG):
                 start = monotonic()
                 _LOGGER.debug("Started batch _send_commands at %s", datetime.now().isoformat())
@@ -487,6 +690,7 @@ class PyHatchBabyRestAsync:
                         self._pending_egb_slots.append(egb_slot)
 
                     if client and client.is_connected:
+                        self._stage = "_send_commands: write"
                         for i, command in enumerate(commands):
                             data = bytearray.fromhex(command) if raw else bytearray(command, "utf-8")
                             _LOGGER.debug("Sending command '%s' (Hex: %s)", command, data.hex())
@@ -494,7 +698,9 @@ class PyHatchBabyRestAsync:
                             if i < len(commands) - 1 and spacing_delay > 0:
                                 await asyncio.sleep(spacing_delay)
                     else:
-                        _LOGGER.warning("Could not send commands: Not connected to device")
+                        _LOGGER.warning(
+                            "%s: Could not send commands: Not connected to device", self.address
+                        )
             finally:
                 self._command_in_flight = False
 
@@ -504,6 +710,8 @@ class PyHatchBabyRestAsync:
                     datetime.now().isoformat(),
                     monotonic() - start,  # pyright: ignore[reportPossiblyUnboundVariable]
                 )
+
+        await self._run_locked("_send_commands", _body)
 
     async def _send_command(self, command: str, raw: bool = False, response: bool = True):
         """Send a single command to the device."""
@@ -803,32 +1011,36 @@ class PyHatchBabyRestAsync:
 
     async def refresh_data(self):
         """Refresh data from Hatch Rest device."""
-        async with self._send_lock_guard("refresh_data") as acquired:
-            if not acquired:
-                return
 
+        async def _body() -> None:
             if log_timing := _LOGGER.isEnabledFor(logging.DEBUG):
                 start = monotonic()
                 _LOGGER.debug("Started refresh_data at %s", datetime.now().isoformat())
 
             async with self._active_operation() as client:
                 if client and client.is_connected:
+                    self._stage = "refresh_data: write GI/GD"
                     await client.write_gatt_char(CHAR_TX, bytearray(b"GI"), response=True)
                     await asyncio.sleep(0.1)
                     await client.write_gatt_char(CHAR_TX, bytearray(b"GD"), response=True)
                     await asyncio.sleep(0.1)
+                    self._stage = "refresh_data: read"
                     raw_char_read = await client.read_gatt_char(CHAR_FEEDBACK)
                     _LOGGER.debug("Raw char read from refresh_data: %s", raw_char_read)
                     self._parse_data(raw_char_read)
                 else:
-                    _LOGGER.warning("Could not refresh data: Not connected to device")
+                    _LOGGER.warning(
+                        "%s: Could not refresh data: Not connected to device", self.address
+                    )
 
-        if log_timing:
-            _LOGGER.debug(
-                "Finished refresh_data at %s (total of %.3f seconds)",
-                datetime.now().isoformat(),
-                monotonic() - start,  # pyright: ignore[reportPossiblyUnboundVariable]
-            )
+            if log_timing:
+                _LOGGER.debug(
+                    "Finished refresh_data at %s (total of %.3f seconds)",
+                    datetime.now().isoformat(),
+                    monotonic() - start,  # pyright: ignore[reportPossiblyUnboundVariable]
+                )
+
+        await self._run_locked("refresh_data", _body)
 
     async def select_favorite(self, index: int):
         """Select a favorite by index (confirmed via btsnoop: SP activates, PSB only edits)."""
