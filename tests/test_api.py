@@ -470,3 +470,145 @@ class TestConnectionDeadlocks:
                 await task
 
         assert api._active_operations == 0
+
+
+class TestStuckLockHolder:
+    """Regression tests for an operation that never returns while HOLDING the lock.
+
+    The send-lock timeout only bounds callers waiting for the lock. In
+    September 2026 a refresh_data() hung inside the lock for five days, and
+    every command to the unit waited 180s and was then dropped.
+    """
+
+    @pytest.fixture
+    def api(self, mock_ble_device: BLEDevice, monkeypatch) -> PyHatchBabyRestAsync:
+        """Create API instance with short operation bounds."""
+        monkeypatch.setattr("custom_components.hatch_rest.api.OPERATION_TIMEOUT", 0.05)
+        monkeypatch.setattr("custom_components.hatch_rest.api.ABANDON_GRACE", 0.05)
+        api = PyHatchBabyRestAsync(mock_ble_device)
+        yield api
+        if api._disconnect_timer:
+            api._disconnect_timer.cancel()
+            api._disconnect_timer = None
+
+    @staticmethod
+    def _connected_client() -> MagicMock:
+        client = MagicMock()
+        client.is_connected = True
+        client.start_notify = AsyncMock()
+        client.write_gatt_char = AsyncMock()
+        client.read_gatt_char = AsyncMock(return_value=bytearray(20))
+        client.disconnect = AsyncMock()
+        client.clear_cache = AsyncMock(return_value=True)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_stuck_holder_is_abandoned_and_lock_released(
+        self, api: PyHatchBabyRestAsync, caplog
+    ):
+        """A hung operation is abandoned and the next command gets through."""
+
+        async def _hang_forever():
+            await asyncio.sleep(3600)
+
+        with patch.object(api, "_client_connect", side_effect=_hang_forever):
+            await asyncio.wait_for(api.refresh_data(), timeout=5)
+
+        assert not api._send_lock.locked()
+        assert api._active_operations == 0
+        assert "did not finish within" in caplog.text
+        assert "_hang_forever" in caplog.text  # the await chain names the leaf
+
+        client = self._connected_client()
+
+        async def _connect():
+            api._client = client
+
+        with patch.object(api, "_client_connect", side_effect=_connect):
+            await asyncio.wait_for(api._send_commands(["SI01"]), timeout=5)
+        client.write_gatt_char.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_holder_that_swallows_cancellation_does_not_keep_lock(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """Even a task that ignores cancel() cannot hold the lock past the bound."""
+        release = asyncio.Event()
+
+        async def _ignore_cancel():
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    continue
+
+        with patch.object(api, "_client_connect", side_effect=_ignore_cancel):
+            await asyncio.wait_for(api.refresh_data(), timeout=5)
+            assert not api._send_lock.locked()
+            assert api._active_operations == 0
+
+            # When the stuck task finally finishes, it must not drive the
+            # counter negative or overwrite the reset state.
+            release.set()
+            for task in asyncio.all_tasks():
+                if task.get_name().endswith("refresh_data"):
+                    task.cancel()
+            await asyncio.sleep(0.05)
+
+        assert api._active_operations == 0
+
+    @pytest.mark.asyncio
+    async def test_operation_exception_still_propagates(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """Running the body in a task must not swallow its exceptions."""
+        with patch.object(api, "_active_operation", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                await api.refresh_data()
+        assert not api._send_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_failure_clears_gatt_cache_and_retries(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """A stale-cache subscribe failure clears the cache and reconnects once."""
+        from bleak.exc import BleakCharacteristicNotFoundError
+
+        stale = self._connected_client()
+        stale.start_notify = AsyncMock(
+            side_effect=BleakCharacteristicNotFoundError("02240003")
+        )
+        fresh = self._connected_client()
+
+        with patch(
+            "custom_components.hatch_rest.api.establish_connection",
+            new_callable=AsyncMock,
+            side_effect=[stale, fresh],
+        ), patch.object(api, "_fetch_favorites", new_callable=AsyncMock), patch.object(
+            api, "_fetch_schedules", new_callable=AsyncMock
+        ):
+            await api._send_commands(["SI01"])
+
+        stale.clear_cache.assert_awaited_once()
+        stale.disconnect.assert_awaited_once()
+        fresh.write_gatt_char.assert_any_await(
+            char_specifier=CHAR_TX, data=bytearray(b"SI01"), response=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_ble_subscribe_error_does_not_retry(
+        self, api: PyHatchBabyRestAsync
+    ):
+        """Only BLE-level failures trigger the cache clear and retry."""
+        broken = self._connected_client()
+        broken.start_notify = AsyncMock(side_effect=TypeError("not a BLE error"))
+
+        with patch(
+            "custom_components.hatch_rest.api.establish_connection",
+            new_callable=AsyncMock,
+            return_value=broken,
+        ) as mock_establish:
+            await api._send_commands(["SI01"])
+
+        broken.clear_cache.assert_not_awaited()
+        assert mock_establish.await_count == 1
